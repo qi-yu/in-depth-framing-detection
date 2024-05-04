@@ -1,0 +1,489 @@
+---
+title: "Modal Particles in Causal Sentences"
+author: "Qi Yu"
+date: "2024-02-27"
+output: html_document
+---
+
+
+```{r, message=FALSE}
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(car)
+library(broom)
+library(caret)
+library(sjPlot)
+library(sjmisc)
+library(ggplot2)
+library(scales)
+library(knitr)
+library(jtools)
+library(RColorBrewer)
+library(logistf)
+library(corrplot)
+```
+
+```{r}
+set.seed(7) # For reproducibility
+theme_set(theme_bw())
+```
+
+
+# 1. Preprocess dataset
+
+```{r}
+df <- read.csv("./data/sentence_level_statistics.tsv", sep="\t", header=TRUE) %>% 
+  subset(select = -c(id, sentence_index, text, text_preprocessed)) %>%
+  filter(total_token_count >= 5) %>%
+  mutate(across(2:last_col(), ~ ./total_token_count)) %>% 
+  mutate(label = as.factor(label)) %>%
+  mutate(causal = as.factor(ifelse(causal == 0, 0, 1))) %>%
+  mutate(common_ground_particles = modal_particles_for_common_ground + modal_particles_for_resigned_acceptance) %>%
+  mutate(common_ground_particles = as.factor(ifelse(common_ground_particles == 0, 0, 1))) %>% 
+  subset(select = -c(total_token_count, modal_particles_for_common_ground, modal_particles_for_resigned_acceptance))
+
+kable(head(df))
+```
+
+
+```{r}
+df_bild <- df %>% 
+  subset(label == 0) %>% 
+  select(-label)
+  
+df_faz <- df %>% 
+  subset(label == 1) %>% 
+  select(-label)
+
+df_sz <- df %>% 
+  subset(label == 2) %>% 
+  select(-label)
+
+n_bild <- nrow(df_bild)
+n_faz <- nrow(df_faz)
+n_sz <- nrow(df_sz)
+
+result <- c(
+  "Number of rows in df_bild: ", n_bild,
+  "Number of rows in df_faz: ", n_faz,
+  "Number of rows in df_sz: ", n_sz
+)
+
+cat(result, sep = "\n")
+```
+
+**Descriptive statistics:**
+
+```{r}
+table(df_bild$causal)
+table(df_bild$common_ground_particles)
+```
+
+```{r}
+table(df_faz$causal)
+table(df_faz$common_ground_particles)
+```
+
+```{r}
+table(df_sz$causal)
+table(df_sz$common_ground_particles)
+```
+
+
+# 2. Fit logistic regression model:
+
+We use the Firth's Bias-Reduced Logistic Regression.
+
+We opt out of using hurdle / zero-inflated model here: there are too few variation of counts in the sentence-level. 
+E.g., when modal particle appears, it usually only appears only once per sentence.
+
+We do not include the interaction terms here because the data has too few variations for some predictors. 
+E.g., in BILD there are only 3 sentences containing modal particles that both are causal sentences and contain keywords for politics. 
+
+
+## 2.1 BILD
+
+### 2.1.1 Fit models
+
+```{r}
+model_bild <- logistf(common_ground_particles ~ causal 
+                  + economy
+                  + identity
+                  + legal
+                  + morality
+                  + policy
+                  + politics
+                  + public_opinion
+                  + security
+                  + welfare, 
+             data = df_bild, firth = TRUE, pl = TRUE)
+
+model_bild_causal_only <- logistf(common_ground_particles ~ causal,
+             data = df_bild, firth = TRUE, pl = TRUE)
+```
+
+### 2.1.2 Validate if the model with numerical predictor meets assumptions of logistic regression
+
+**(1) Validate if the linear assumption is met using Box-Tidwell test:**
+
+```{r}
+box_tidwell_test <- function(data, x_col) {
+  formula <- as.formula(paste("common_ground_particles ~ ", x_col, " * log(", x_col, ")"))
+  model <- logistf(formula, data = data, family = binomial())
+  return(model)
+}
+```
+
+Add a small constant to the zero-values for the Box-Tidwell test, as log(0) is not defined:
+
+```{r}
+constant <- 1e-16
+
+df_bild_added_constant <- df_bild %>%
+  mutate(across(where(is.numeric), ~ . + constant))
+
+kable(head(df_bild_added_constant))
+```
+
+
+```{r, echo=TRUE, results='hide', warning=FALSE}
+x_columns_numeric <- setdiff(names(df), c("label", "common_ground_particles", "causal"))
+p_values <- c()
+
+for (col in x_columns_numeric) {
+  model_box_tidwell <- box_tidwell_test(df_bild_added_constant, col)
+  p_values <- c(p_values, summary(model_box_tidwell)$prob[4])
+}
+```
+
+Adjust p-values for Box-Tidwell tests: 
+
+```{r}
+p.adjust(p_values, method="holm")
+```
+
+**Conclusion:**
+
+No variable violates the linearity assumption (adjusted p-value of the interaction term is higher than 0.05).
+
+**(2) Validate if there are multicollinearity using variance inflation factors:**
+
+
+```{r}
+model_bild_multicoll <- glm(common_ground_particles ~ causal 
+                  + economy
+                  + identity
+                  + legal
+                  + morality
+                  + policy
+                  + politics
+                  + public_opinion
+                  + security
+                  + welfare, 
+             data = df_bild, family = "binomial")
+
+vif(model_bild_multicoll)
+```
+
+**Conclusion:**
+
+No multicollinearity is found (all variables have a value of VIF below 5).
+
+
+
+### 2.1.3 Select final model and get results
+
+```{r}
+anova(model_bild_causal_only, model_bild, method="PLR")
+```
+
+**Conclusion:**
+
+The model with topical predictors does not improve the model fit significantly. We choose the model *model_bild_causal_only* as our final model.
+
+```{r}
+summary(model_bild_causal_only)
+```
+
+
+```{r, echo=FALSE, message=FALSE}
+# p_coef_bild <- plot_model(model_bild, vline.color = "black", transform = NULL, show.values = TRUE, value.offset = .3, title = "Modal Particles: BILD")
+# p_coef_bild
+# ggsave("./plots/coefficient_bild.pdf", p_coef_bild, height = 4)
+```
+
+## 2.2 FAZ 
+
+### 2.2.1 Fit models
+
+
+```{r}
+model_faz <- logistf(common_ground_particles ~ causal
+                + economy
+                + identity
+                + legal
+                + morality
+                + policy
+                + politics
+                + public_opinion
+                + security
+                + welfare, 
+                data = df_faz, firth = TRUE, pl = TRUE)
+
+model_faz_causal_only <- logistf(common_ground_particles ~ causal,
+             data = df_faz, firth = TRUE, pl = TRUE)
+```
+
+
+
+### 2.2.2 Validate if the model with numerical predictor meets assumptions of logistic regression
+
+**(1) Validate if the linear assumption is met using Box-Tidwell test:**
+
+```{r}
+df_faz_added_constant <- df_faz %>%
+  mutate(across(where(is.numeric), ~ . + constant))
+
+kable(head(df_faz_added_constant))
+```
+
+
+```{r, echo=TRUE, results='hide', warning=FALSE}
+p_values <- c()
+
+for (col in x_columns_numeric) {
+  model_box_tidwell <- box_tidwell_test(df_faz_added_constant, col)
+  p_values <- c(p_values, summary(model_box_tidwell)$prob[4])
+}
+```
+
+
+
+Adjust p-values for Box-Tidwell tests: 
+
+```{r}
+p.adjust(p_values, method="holm")
+```
+
+
+**Conclusion:**
+
+No variable violates the linearity assumption (p-value of the interaction term is higher than 0.05).
+
+
+**(2) Validate if there are multicollinearity using variance inflation factors:**
+
+
+```{r}
+model_faz_multicoll <- glm(common_ground_particles ~ causal 
+                  + economy
+                  + identity
+                  + legal
+                  + morality
+                  + policy
+                  + politics
+                  + public_opinion
+                  + security
+                  + welfare, 
+             data = df_faz, family = "binomial")
+
+vif(model_faz_multicoll)
+```
+
+**Conclusion:**
+
+No multicollinearity is found (all variables have a value of VIF below 5).
+
+### 2.2.3 Select final model and get results
+
+```{r}
+anova(model_faz_causal_only, model_faz, method="PLR")
+```
+
+**Conclusion:**
+
+The model with topical predictors improves the model fit significantly. We choose the model *model_faz* as our final model.
+
+```{r}
+summary(model_faz)
+```
+
+
+```{r, message=FALSE, echo=FALSE}
+p_coef_faz <- plot_model(model_faz, vline.color = "black", transform = NULL, show.values = TRUE, value.offset = .3, title = "Modal Particles: FAZ") +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+p_coef_faz
+ggsave("./plots/coefficient_faz.pdf", p_coef_faz, height = 4)
+```
+
+
+
+## 2.3 SZ
+
+### 2.3.1 Fit models 
+
+
+```{r}
+model_sz <- logistf(common_ground_particles ~ causal
+                + economy
+                + identity 
+                + legal
+                + morality
+                + policy
+                + politics 
+                + public_opinion 
+                + security
+                + welfare, 
+                data = df_sz, firth = TRUE, pl = TRUE)
+
+model_sz_causal_only <- logistf(common_ground_particles ~ causal,
+             data = df_sz, firth = TRUE, pl = TRUE)
+```
+
+
+### 2.3.2 Validate if the model with numerical predictor meets assumptions of logistic regression
+
+**(1) Validate if the linear assumption is met using Box-Tidwell test:**
+
+```{r}
+df_sz_added_constant <- df_sz %>%
+  mutate(across(where(is.numeric), ~ . + constant))
+
+kable(head(df_sz_added_constant))
+```
+
+
+```{r, echo=TRUE, results='hide', warning=FALSE}
+p_values <- c()
+
+for (col in x_columns_numeric) {
+  model_box_tidwell <- box_tidwell_test(df_sz_added_constant, col)
+  p_values <- c(p_values, summary(model_box_tidwell)$prob[4])
+}
+```
+
+Adjust p-values for Box-Tidwell tests: 
+
+```{r}
+p.adjust(p_values, method="holm")
+```
+
+
+**Conclusion:**
+
+No variable violates the linearity assumption (all adjusted p-values of the interaction term are higher than 0.05). 
+
+**(2) Validate if there are multicollinearity using variance inflation factors:**
+
+```{r}
+model_sz_multicoll <- glm(common_ground_particles ~ causal 
+                  + economy
+                  + identity
+                  + legal
+                  + morality
+                  + policy
+                  + politics
+                  + public_opinion
+                  + security
+                  + welfare, 
+             data = df_sz, family = "binomial")
+vif(model_sz_multicoll)
+```
+
+**Conclusion:**
+
+No multicollinearity is found (all variables have a value of VIF below 5.).
+
+### 2.3.3 Select final model and get results
+
+```{r}
+anova(model_sz_causal_only, model_sz, method="PLR")
+```
+
+**Conclusion:**
+
+The model with topical predictors improves the model fit significantly. We choose the model *model_sz* as our final model.
+
+
+```{r}
+summary(model_sz)
+```
+
+
+```{r, message=FALSE, echo=FALSE}
+p_coef_sz <- plot_model(model_sz, vline.color = "black", transform = NULL, show.values = TRUE, value.offset = .3, title = "Modal Particles: SZ") +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+p_coef_sz
+ggsave("./plots/coefficient_sz.pdf", p_coef_sz, height = 4)
+```
+
+
+# 3. Get variable importance
+
+
+```{r}
+source <- c("faz", "sz")
+idx <- 1
+
+for (model in list(model_faz, model_sz)) {
+  z_values <- coef(model) / sqrt(diag(vcov(model)))
+  z_values <- rownames_to_column(as.data.frame(z_values), var = "predictor")
+  z_values <- z_values[z_values$predictor != "(Intercept)", ]
+  z_values <- z_values[order(z_values$z_values, decreasing = TRUE), ]
+  
+  z_values$color <- ifelse(z_values$predictor == "causal1", "#BF608D", "#666F91")
+  
+  source_upper <- toupper(source[idx])
+  p <- ggplot(z_values, aes(x = reorder(predictor, z_values), y = z_values)) +
+    geom_bar(stat = "identity", fill = z_values$color, width = 0.6) +  
+    coord_flip() + 
+    labs(x = "", y = "|z|", title = paste("Variable Importance:", source_upper, sep=" ")) +
+    theme(
+      axis.text = element_text(size = 8),  
+      axis.title = element_text(size = 9),  
+      plot.title = element_text(size = 9)  
+    ) + 
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+  
+  print(p)
+  
+  ggsave(paste("./plots/", "variable_importance_", source[idx], ".pdf", sep = ""),
+         plot = p,
+         height = 2,
+         width = 5
+        )
+
+  idx <- idx + 1
+}
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
